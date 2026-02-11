@@ -45,7 +45,8 @@ class AutoencoderTrainingWrapper(pl.LightningModule):
             force_input_mono = False,
             latent_mask_ratio = 0.0,
             teacher_model: Optional[AudioAutoencoder] = None,
-            clip_grad_norm = 0.0
+            clip_grad_norm = 0.0,
+            power_channels = 0
     ):
         super().__init__()
 
@@ -240,8 +241,6 @@ class AutoencoderTrainingWrapper(pl.LightningModule):
         if self.autoencoder.bottleneck is not None:
             self.gen_loss_modules += create_loss_modules_from_bottleneck(self.autoencoder.bottleneck, self.loss_config)
 
-        self.losses_gen = MultiLoss(self.gen_loss_modules)
-
         if self.use_disc:
             self.disc_loss_modules = [
                 ValueLoss(key='loss_dis', weight=1.0, name='discriminator_loss'),
@@ -264,6 +263,23 @@ class AutoencoderTrainingWrapper(pl.LightningModule):
             )
 
         self.latent_mask_ratio = latent_mask_ratio
+
+        # Power-channel invariance: push non-power channels to be gain-agnostic
+        self.power_channels = power_channels
+        if self.power_channels > 0:
+            assert "power_channel" in loss_config, \
+                "power_channels > 0 requires a 'power_channel' entry in loss_configs"
+            pc_config = loss_config["power_channel"].get("config", {})
+            self.gain_db_min = pc_config.get("gain_db_min", -6)
+            self.gain_db_max = pc_config.get("gain_db_max", 6)
+            self.gen_loss_modules.append(
+                MSELoss(key_a='latents_power_agnostic', key_b='gained_latents_power_agnostic',
+                        weight=loss_config["power_channel"]["weights"].get("power_channel", 1.0),
+                        name='power_channel_loss')
+            )
+
+        # Rebuild the gen loss after adding power channel module
+        self.losses_gen = MultiLoss(self.gen_loss_modules)
 
         # evaluation losses & metrics
         self.eval_losses = torch.nn.ModuleDict()
@@ -406,6 +422,25 @@ class AutoencoderTrainingWrapper(pl.LightningModule):
             with torch.no_grad():
                 teacher_latents = self.teacher_model.encode(encoder_input, return_info=False)
                 loss_info['teacher_latents'] = teacher_latents
+
+        # Power-channel invariance: encode a gained version and compare non-power latent channels
+        if self.power_channels > 0:
+            # Apply random gain per sample: g = 10^(uniform(db_min, db_max) / 20)
+            gained_input = encoder_input * (10.0 ** (
+                torch.empty(encoder_input.shape[0], 1, 1, device=encoder_input.device)
+                .uniform_(self.gain_db_min, self.gain_db_max) / 20.0
+            ))
+
+            # Encode the gained input (no need for encoder_info, just latents)
+            if self.warmed_up and self.encoder_freeze_on_warmup:
+                with torch.no_grad():
+                    gained_latents = self.autoencoder.encode(gained_input, return_info=False)
+            else:
+                gained_latents = self.autoencoder.encode(gained_input, return_info=False)
+
+            # Store non-power channels for the MSE loss (channels after the first power_channels)
+            loss_info['latents_power_agnostic'] = latents[:, self.power_channels:, :]
+            loss_info['gained_latents_power_agnostic'] = gained_latents[:, self.power_channels:, :]
 
         # Optionally mask out some latents for noise resistance
         if self.latent_mask_ratio > 0.0:

@@ -27,7 +27,8 @@
         },
         "latent_dim": 64,
         "downsampling_ratio": 1024,
-        "io_channels": 1
+        "io_channels": 1,
+        "power_channels": 0
     },
     "training": {
         "learning_rate": 1e-4,
@@ -101,6 +102,15 @@
                 "type": "kl",
                 "weights": {
                     "kl": 1e-6
+                }
+            },
+            "power_channel": {
+                "config": {
+                    "gain_db_min": -6,
+                    "gain_db_max": 6
+                },
+                "weights": {
+                    "power_channel": 0.1
                 }
             }
         },
