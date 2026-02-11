@@ -2,12 +2,12 @@
     "model_type": "autoencoder",
     "sample_size": 65536,
     "sample_rate": 44100,
-    "audio_channels": 2,
+    "audio_channels": 1,
     "model": {
         "encoder": {
             "type": "dac",
             "config": {
-                "in_channels": 2,
+                "in_channels": 1,
                 "latent_dim": 128,
                 "d_model": 128,
                 "strides": [4, 4, 8, 8]
@@ -16,7 +16,7 @@
         "decoder": {
             "type": "dac",
             "config": {
-                "out_channels": 2,
+                "out_channels": 1,
                 "latent_dim": 64,
                 "channels": 1536,
                 "rates": [8, 8, 4, 4]
@@ -27,7 +27,7 @@
         },
         "latent_dim": 64,
         "downsampling_ratio": 1024,
-        "io_channels": 2
+        "io_channels": 1
     },
     "training": {
         "learning_rate": 1e-4,

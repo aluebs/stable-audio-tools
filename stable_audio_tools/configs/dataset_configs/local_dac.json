@@ -1,0 +1,11 @@
+{
+    "dataset_type": "audio_dir",
+    "datasets": [
+        {
+            "id": "dac",
+            "path": "/data/dac/"
+        }
+    ],
+    "random_crop": true
+}
+

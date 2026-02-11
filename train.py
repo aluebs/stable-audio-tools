@@ -84,8 +84,10 @@ def main():
 
     exc_callback = ExceptionCallback()
 
+    run_name = args.name if args.name else (os.path.basename(os.path.normpath(args.save_dir)) if args.save_dir else None)
+
     if args.logger == 'wandb':
-        logger = pl.loggers.WandbLogger(project=args.name)
+        logger = pl.loggers.WandbLogger(project="stable-audio-codecs", name=run_name)
         logger.watch(training_wrapper)
     
         if args.save_dir and isinstance(logger.experiment.id, str):
@@ -155,7 +157,7 @@ def main():
         callbacks=[ckpt_callback, demo_callback, exc_callback, save_model_config_callback],
         logger=logger,
         log_every_n_steps=1,
-        max_epochs=10000000,
+        max_epochs=1,
         default_root_dir=args.save_dir,
         gradient_clip_val=args.gradient_clip_val,
         reload_dataloaders_every_n_epochs = 0,
