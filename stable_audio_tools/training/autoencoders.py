@@ -431,16 +431,25 @@ class AutoencoderTrainingWrapper(pl.LightningModule):
                 .uniform_(self.gain_db_min, self.gain_db_max) / 20.0
             ))
 
-            # Encode the gained input (no need for encoder_info, just latents)
+            # Encode the gained input
             if self.warmed_up and self.encoder_freeze_on_warmup:
                 with torch.no_grad():
-                    gained_latents = self.autoencoder.encode(gained_input, return_info=False)
+                    gained_latents, gained_encoder_info = self.autoencoder.encode(gained_input, return_info=True)
             else:
-                gained_latents = self.autoencoder.encode(gained_input, return_info=False)
+                gained_latents, gained_encoder_info = self.autoencoder.encode(gained_input, return_info=True)
 
-            # Store non-power channels for the MSE loss (channels after the first power_channels)
-            loss_info['latents_power_agnostic'] = latents[:, self.power_channels:, :]
-            loss_info['gained_latents_power_agnostic'] = gained_latents[:, self.power_channels:, :]
+            # Use pre-bottleneck latents (deterministic encoder output) for the
+            # invariance loss to avoid comparing stochastic VAE samples drawn
+            # with independent noise, which would create an irreducible MSE
+            # floor and conflict with the KL divergence objective.
+            # pre-bottleneck latents have shape [B, 2*latent_dim, T] for VAE
+            # (first half = mean, second half = scale). Compare only the
+            # mean portion, skipping the first power_channels.
+            pre_bn = encoder_info["pre_bottleneck_latents"]
+            gained_pre_bn = gained_encoder_info["pre_bottleneck_latents"]
+            latent_dim = pre_bn.shape[1] // 2
+            loss_info['latents_power_agnostic'] = pre_bn[:, self.power_channels:latent_dim, :]
+            loss_info['gained_latents_power_agnostic'] = gained_pre_bn[:, self.power_channels:latent_dim, :]
 
         # Optionally mask out some latents for noise resistance
         if self.latent_mask_ratio > 0.0:
