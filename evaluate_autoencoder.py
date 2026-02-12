@@ -26,6 +26,7 @@ import sys
 import numpy as np
 import scipy.stats
 import torch
+import torchaudio
 import torchaudio.transforms as T
 from tqdm import tqdm
 from visqol import visqol_lib_py
@@ -102,6 +103,7 @@ def evaluate(
     max_samples: int = 0,
     device: str = "cuda",
     speech_mode: bool = False,
+    out_path: str = "",
 ):
     """Evaluate an unwrapped autoencoder using ViSQOL (encode → decode → compare).
 
@@ -114,10 +116,16 @@ def evaluate(
         max_samples: Maximum number of samples to evaluate. 0 = all.
         device: Device to run the model on.
         speech_mode: Use ViSQOL speech mode instead of audio mode.
+        out_path: Directory to write original/reconstructed wav files for listening.
     """
     assert model_config, "--model_config is required"
     assert ckpt_path, "--ckpt_path is required"
     assert dataset_config, "--dataset_config is required"
+
+    save_audio = bool(out_path)
+    if save_audio:
+        os.makedirs(os.path.join(out_path, "original"), exist_ok=True)
+        os.makedirs(os.path.join(out_path, "reconstructed"), exist_ok=True)
 
     # ---- load configs ----
     with open(model_config) as f:
@@ -125,7 +133,7 @@ def evaluate(
 
     with open(dataset_config) as f:
         dataset_cfg = json.load(f)
-    dataset_cfg["random_crop"] = False
+    dataset_cfg["random_crop"] = True
     dataset_cfg["drop_last"] = False
 
     # ---- build model and load weights ----
@@ -137,12 +145,13 @@ def evaluate(
     print("Model ready.")
 
     # ---- build dataloader ----
+    # Use 10-second crops instead of the model's default sample_size
     data_loader = create_dataloader_from_config(
         dataset_cfg,
         batch_size=batch_size,
         num_workers=num_workers,
         sample_rate=model_cfg["sample_rate"],
-        sample_size=model_cfg["sample_size"],
+        sample_size=model_cfg["sample_rate"] * 10,
         audio_channels=model_cfg.get("audio_channels", 1),
         shuffle=False,
     )
@@ -198,6 +207,11 @@ def evaluate(
                 total_processed += 1
             except Exception as e:
                 print(f"\n[WARNING] ViSQOL failed on sample {total_processed}: {e}", file=sys.stderr)
+
+            if save_audio:
+                sr = model_cfg["sample_rate"]
+                torchaudio.save(os.path.join(out_path, "original", f"{total_processed:05d}.wav"), audio_cpu[i], sr)
+                torchaudio.save(os.path.join(out_path, "reconstructed", f"{total_processed:05d}.wav"), reconstructed_cpu[i], sr)
 
             # Update progress bar with running statistics
             if scores:

@@ -1,0 +1,11 @@
+{
+    "dataset_type": "audio_dir",
+    "datasets": [
+        {
+            "id": "daps_test",
+            "path": "/data/daps_test"
+        }
+    ],
+    "random_crop": true
+}
+
