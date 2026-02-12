@@ -9,6 +9,7 @@ setup(
     packages=find_packages(),  
     install_requires=[
         'alias-free-torch==0.0.6',
+        'argbind',
         'auraloss==0.4.0',
         'descript-audio-codec==1.0.0',
         'einops',
@@ -29,11 +30,14 @@ setup(
         'sentencepiece==0.1.99',
         'torch>=2.5.1',
         'torchaudio>=2.5.1',
+        'torchcodec',
         'torchmetrics==0.11.4',
+        'torchvision',
         'tqdm',
         'transformers',
         'v-diffusion-pytorch==0.0.2',
         'vector-quantize-pytorch==1.14.41',
+        'visqol',
         'wandb==0.15.4',
         'webdataset==0.2.100'
     ],
