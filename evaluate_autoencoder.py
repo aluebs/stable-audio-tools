@@ -1,7 +1,7 @@
 """
 Evaluate an unwrapped autoencoder model using ViSQOL.
 
-Usage:
+Single-GPU usage:
     python evaluate_autoencoder.py \
         --model_config stable_audio_tools/configs/model_configs/autoencoders/stable_audio_2_0_vae.json \
         --ckpt_path exported_model.ckpt \
@@ -10,6 +10,10 @@ Usage:
         --num_workers 6 \
         --max_samples 0          # 0 = use all samples
         --device cuda
+
+Multi-GPU usage (e.g. GPUs 4-7):
+    CUDA_VISIBLE_DEVICES=4,5,6,7 torchrun --nproc_per_node=4 evaluate_autoencoder.py \
+        --model_config ... --ckpt_path ... --dataset_config ...
 
     You can also use a YAML config file:
         python evaluate_autoencoder.py --args.load config.yml
@@ -26,8 +30,11 @@ import sys
 import numpy as np
 import scipy.stats
 import torch
+import torch.distributed as dist
 import torchaudio
 import torchaudio.transforms as T
+from torch.utils.data import DataLoader
+from torch.utils.data.distributed import DistributedSampler
 from tqdm import tqdm
 from visqol import visqol_lib_py
 from visqol.pb2 import visqol_config_pb2, similarity_result_pb2
@@ -108,14 +115,16 @@ def evaluate(
 ):
     """Evaluate an unwrapped autoencoder using ViSQOL (encode → decode → compare).
 
+    Supports single-GPU (``python``) and multi-GPU (``torchrun``) execution.
+
     Args:
         model_config: Path to the model config JSON (e.g. stable_audio_1_0_vae.json).
         ckpt_path: Path to the unwrapped model checkpoint (.ckpt or .safetensors).
         dataset_config: Path to the dataset config JSON.
-        batch_size: Batch size for inference.
-        num_workers: Number of dataloader workers.
+        batch_size: Batch size for inference (per GPU).
+        num_workers: Number of dataloader workers (per GPU).
         max_samples: Maximum number of samples to evaluate. 0 = all.
-        device: Device to run the model on.
+        device: Device to run the model on (ignored in multi-GPU mode).
         speech_mode: Use ViSQOL speech mode instead of audio mode.
         out_path: Directory to write original/reconstructed wav files for listening.
         gain: Linear gain applied to audio for the swapped-latent experiment (default 2.0).
@@ -124,8 +133,25 @@ def evaluate(
     assert ckpt_path, "--ckpt_path is required"
     assert dataset_config, "--dataset_config is required"
 
+    # ---- distributed setup ----
+    distributed = "LOCAL_RANK" in os.environ
+    if distributed:
+        dist.init_process_group(backend="nccl")
+        rank = dist.get_rank()
+        world_size = dist.get_world_size()
+        device = f"cuda:{int(os.environ['LOCAL_RANK'])}"
+        torch.cuda.set_device(device)
+    else:
+        rank = 0
+        world_size = 1
+
+    def log(msg):
+        """Print only on rank 0."""
+        if rank == 0:
+            print(msg)
+
     save_audio = bool(out_path)
-    if save_audio:
+    if save_audio and rank == 0:
         os.makedirs(os.path.join(out_path, "original"), exist_ok=True)
         os.makedirs(os.path.join(out_path, "reconstructed"), exist_ok=True)
         os.makedirs(os.path.join(out_path, "swapped"), exist_ok=True)
@@ -140,16 +166,16 @@ def evaluate(
     dataset_cfg["drop_last"] = False
 
     # ---- build model and load weights ----
-    print("Creating model from config …")
+    log("Creating model from config …")
     model = create_model_from_config(model_cfg)
-    print(f"Loading checkpoint from {ckpt_path} …")
+    log(f"Loading checkpoint from {ckpt_path} …")
     copy_state_dict(model, load_ckpt_state_dict(ckpt_path))
     model.to(device).eval().requires_grad_(False)
-    print("Model ready.")
+    log("Model ready.")
 
     # ---- build dataloader ----
     # Use 10-second crops instead of the model's default sample_size
-    data_loader = create_dataloader_from_config(
+    tmp_loader = create_dataloader_from_config(
         dataset_cfg,
         batch_size=batch_size,
         num_workers=num_workers,
@@ -159,8 +185,23 @@ def evaluate(
         shuffle=False,
     )
 
-    # ---- set up ViSQOL ----
-    print("Initialising ViSQOL …")
+    if distributed:
+        # Re-wrap the dataset with a DistributedSampler so each GPU
+        # processes a different shard of the data.
+        data_loader = DataLoader(
+            tmp_loader.dataset,
+            batch_size=batch_size,
+            sampler=DistributedSampler(tmp_loader.dataset, shuffle=False),
+            num_workers=num_workers,
+            pin_memory=True,
+        )
+        log(f"Distributed evaluation: {world_size} GPUs, "
+            f"{len(tmp_loader.dataset)} samples total.")
+    else:
+        data_loader = tmp_loader
+
+    # ---- set up ViSQOL (one instance per process) ----
+    log("Initialising ViSQOL …")
     visqol_api = make_visqol_api(use_speech_mode=speech_mode)
 
     # Resampler from model sample rate → 48 kHz (if needed)
@@ -175,7 +216,7 @@ def evaluate(
     total_processed = 0
     effective_max = max_samples if max_samples > 0 else float("inf")
 
-    pbar = tqdm(data_loader, desc="Evaluating", unit="batch")
+    pbar = tqdm(data_loader, desc="Evaluating", unit="batch", disable=(rank != 0))
     for batch in pbar:
         audio = batch[0].to(device)  # (B, C, T)
 
@@ -230,7 +271,7 @@ def evaluate(
 
             total_processed += 1
 
-            if save_audio:
+            if save_audio and rank == 0:
                 sr = model_cfg["sample_rate"]
                 torchaudio.save(os.path.join(out_path, "original", f"{total_processed:05d}.wav"), audio_cpu[i], sr)
                 torchaudio.save(os.path.join(out_path, "reconstructed", f"{total_processed:05d}.wav"), reconstructed_cpu[i], sr)
@@ -240,12 +281,26 @@ def evaluate(
             if scores:
                 running_mean = np.mean(scores)
                 sw_mean = np.mean(swapped_scores) if swapped_scores else 0.0
-                pbar.set_postfix(visqol=f"{running_mean:.4f}", swapped=f"{sw_mean:.4f}", n=len(scores))
+                pbar.set_postfix(visqol=f"{running_mean:.4f}", swapped=f"{sw_mean:.4f}", n=f"~{len(scores) * world_size}")
 
         if total_processed >= effective_max:
             break
 
-    # ---- report results ----
+    # ---- gather scores across all ranks ----
+    if distributed:
+        all_scores = [None] * world_size
+        all_swapped = [None] * world_size
+        dist.all_gather_object(all_scores, scores)
+        dist.all_gather_object(all_swapped, swapped_scores)
+        # Flatten lists from all ranks
+        scores = [s for rank_scores in all_scores for s in rank_scores]
+        swapped_scores = [s for rank_scores in all_swapped for s in rank_scores]
+        dist.destroy_process_group()
+
+    # ---- report results (rank 0 only) ----
+    if rank != 0:
+        return
+
     if not scores and not swapped_scores:
         print("\nNo scores were computed. Check your dataset / model.")
         return
@@ -255,11 +310,11 @@ def evaluate(
     if scores:
         mean, ci = mean_confidence_interval(scores, confidence=0.95)
         print(f"  ViSQOL Evaluation – Reconstructed  ({len(scores)} samples)")
-    print("=" * 60)
-    print(f"  Mean MOS-LQO :  {mean:.4f} ± {ci:.4f}")
-    print(f"  Std Dev      :  {np.std(scores):.4f}")
-    print(f"  Min / Max    :  {np.min(scores):.4f} / {np.max(scores):.4f}")
-    print("=" * 60)
+        print("=" * 60)
+        print(f"  Mean MOS-LQO :  {mean:.4f} ± {ci:.4f}")
+        print(f"  Std Dev      :  {np.std(scores):.4f}")
+        print(f"  Min / Max    :  {np.min(scores):.4f} / {np.max(scores):.4f}")
+        print("=" * 60)
 
     if swapped_scores:
         sw_mean, sw_ci = mean_confidence_interval(swapped_scores, confidence=0.95)
