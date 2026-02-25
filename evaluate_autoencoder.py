@@ -104,6 +104,7 @@ def evaluate(
     device: str = "cuda",
     speech_mode: bool = False,
     out_path: str = "",
+    gain: float = 2.0,
 ):
     """Evaluate an unwrapped autoencoder using ViSQOL (encode → decode → compare).
 
@@ -117,6 +118,7 @@ def evaluate(
         device: Device to run the model on.
         speech_mode: Use ViSQOL speech mode instead of audio mode.
         out_path: Directory to write original/reconstructed wav files for listening.
+        gain: Linear gain applied to audio for the swapped-latent experiment (default 2.0).
     """
     assert model_config, "--model_config is required"
     assert ckpt_path, "--ckpt_path is required"
@@ -126,6 +128,7 @@ def evaluate(
     if save_audio:
         os.makedirs(os.path.join(out_path, "original"), exist_ok=True)
         os.makedirs(os.path.join(out_path, "reconstructed"), exist_ok=True)
+        os.makedirs(os.path.join(out_path, "swapped"), exist_ok=True)
 
     # ---- load configs ----
     with open(model_config) as f:
@@ -168,6 +171,7 @@ def evaluate(
 
     # ---- evaluation loop ----
     scores = []
+    swapped_scores = []
     total_processed = 0
     effective_max = max_samples if max_samples > 0 else float("inf")
 
@@ -176,13 +180,21 @@ def evaluate(
         audio = batch[0].to(device)  # (B, C, T)
 
         with torch.no_grad():
-            reconstructed = model.decode(model.encode(audio))
+            # Regular encode → decode
+            latent = model.encode(audio)
+            reconstructed = model.decode(latent)
 
-        # Ensure reconstructed has the same length as original
-        min_len = min(audio.shape[-1], reconstructed.shape[-1])
+            # Gained-audio encode, swap first latent channel, decode
+            latent_gained = model.encode(audio * gain)
+            latent_gained[:, 0:1, :] = latent[:, 0:1, :]
+            swapped = model.decode(latent_gained)
+
+        # Ensure outputs have the same length as original
+        min_len = min(audio.shape[-1], reconstructed.shape[-1], swapped.shape[-1])
         # Move to CPU for ViSQOL computation
         audio_cpu = audio[..., :min_len].cpu()
         reconstructed_cpu = reconstructed[..., :min_len].cpu()
+        swapped_cpu = swapped[..., :min_len].cpu()
 
         for i in range(audio_cpu.shape[0]):
             if total_processed >= effective_max:
@@ -191,50 +203,72 @@ def evaluate(
             # Mix down to mono (ViSQOL expects mono)
             ref = audio_cpu[i].mean(dim=0)          # (T,)
             deg = reconstructed_cpu[i].mean(dim=0)   # (T,)
+            deg_sw = swapped_cpu[i].mean(dim=0)      # (T,)
 
             # Resample to 48 kHz if needed
             if resampler is not None:
                 ref = resampler(ref.unsqueeze(0)).squeeze(0)
                 deg = resampler(deg.unsqueeze(0)).squeeze(0)
+                deg_sw = resampler(deg_sw.unsqueeze(0)).squeeze(0)
 
             # Convert to float64 numpy (ViSQOL requirement)
             ref_np = ref.numpy().astype(np.float64)
             deg_np = deg.numpy().astype(np.float64)
+            deg_sw_np = deg_sw.numpy().astype(np.float64)
 
             try:
                 score = compute_visqol(visqol_api, ref_np, deg_np)
                 scores.append(score)
-                total_processed += 1
             except Exception as e:
-                print(f"\n[WARNING] ViSQOL failed on sample {total_processed}: {e}", file=sys.stderr)
+                print(f"\n[WARNING] ViSQOL failed on sample {total_processed} (reconstructed): {e}", file=sys.stderr)
+
+            try:
+                sw_score = compute_visqol(visqol_api, ref_np, deg_sw_np)
+                swapped_scores.append(sw_score)
+            except Exception as e:
+                print(f"\n[WARNING] ViSQOL failed on sample {total_processed} (swapped): {e}", file=sys.stderr)
+
+            total_processed += 1
 
             if save_audio:
                 sr = model_cfg["sample_rate"]
                 torchaudio.save(os.path.join(out_path, "original", f"{total_processed:05d}.wav"), audio_cpu[i], sr)
                 torchaudio.save(os.path.join(out_path, "reconstructed", f"{total_processed:05d}.wav"), reconstructed_cpu[i], sr)
+                torchaudio.save(os.path.join(out_path, "swapped", f"{total_processed:05d}.wav"), swapped_cpu[i], sr)
 
             # Update progress bar with running statistics
             if scores:
                 running_mean = np.mean(scores)
-                pbar.set_postfix(visqol=f"{running_mean:.4f}", n=len(scores))
+                sw_mean = np.mean(swapped_scores) if swapped_scores else 0.0
+                pbar.set_postfix(visqol=f"{running_mean:.4f}", swapped=f"{sw_mean:.4f}", n=len(scores))
 
         if total_processed >= effective_max:
             break
 
     # ---- report results ----
-    if not scores:
+    if not scores and not swapped_scores:
         print("\nNo scores were computed. Check your dataset / model.")
         return
 
-    mean, ci = mean_confidence_interval(scores, confidence=0.95)
-
     print("\n" + "=" * 60)
-    print(f"  ViSQOL Evaluation Results  ({len(scores)} samples)")
+
+    if scores:
+        mean, ci = mean_confidence_interval(scores, confidence=0.95)
+        print(f"  ViSQOL Evaluation – Reconstructed  ({len(scores)} samples)")
     print("=" * 60)
     print(f"  Mean MOS-LQO :  {mean:.4f} ± {ci:.4f}")
     print(f"  Std Dev      :  {np.std(scores):.4f}")
     print(f"  Min / Max    :  {np.min(scores):.4f} / {np.max(scores):.4f}")
     print("=" * 60)
+
+    if swapped_scores:
+        sw_mean, sw_ci = mean_confidence_interval(swapped_scores, confidence=0.95)
+        print(f"  ViSQOL Evaluation – Swapped Latent (gain={gain})  ({len(swapped_scores)} samples)")
+        print("=" * 60)
+        print(f"  Mean MOS-LQO :  {sw_mean:.4f} ± {sw_ci:.4f}")
+        print(f"  Std Dev      :  {np.std(swapped_scores):.4f}")
+        print(f"  Min / Max    :  {np.min(swapped_scores):.4f} / {np.max(swapped_scores):.4f}")
+        print("=" * 60)
 
 
 # ---------------------------------------------------------------------------
