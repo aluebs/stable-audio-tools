@@ -83,6 +83,21 @@ def compute_visqol(api, reference: np.ndarray, degraded: np.ndarray) -> float:
 
 
 # ---------------------------------------------------------------------------
+# Gain in dB
+# ---------------------------------------------------------------------------
+
+def gain_db(reference: np.ndarray, degraded: np.ndarray) -> float:
+    """Compute the gain in dB of *degraded* relative to *reference*.
+
+    gain_dB = 20 * log10(rms_degraded / rms_reference)
+
+    A positive value means the degraded signal is louder than the reference.
+    Both inputs should be 1-D float64 numpy arrays.
+    """
+    return 10.0 * np.log10(np.mean(degraded ** 2) / (np.mean(reference ** 2) + 1e-12))
+
+
+# ---------------------------------------------------------------------------
 # Confidence interval
 # ---------------------------------------------------------------------------
 
@@ -213,6 +228,8 @@ def evaluate(
     # ---- evaluation loop ----
     scores = []
     swapped_scores = []
+    recon_gain_dbs = []
+    swapped_gain_dbs = []
     total_processed = 0
     effective_max = max_samples if max_samples > 0 else float("inf")
 
@@ -269,6 +286,10 @@ def evaluate(
             except Exception as e:
                 print(f"\n[WARNING] ViSQOL failed on sample {total_processed} (swapped): {e}", file=sys.stderr)
 
+            # Gain in dB relative to the reference
+            recon_gain_dbs.append(gain_db(ref_np, deg_np))
+            swapped_gain_dbs.append(gain_db(ref_np, deg_sw_np))
+
             total_processed += 1
 
             if save_audio and rank == 0:
@@ -281,7 +302,13 @@ def evaluate(
             if scores:
                 running_mean = np.mean(scores)
                 sw_mean = np.mean(swapped_scores) if swapped_scores else 0.0
-                pbar.set_postfix(visqol=f"{running_mean:.4f}", swapped=f"{sw_mean:.4f}", n=f"~{len(scores) * world_size}")
+                r_gdb = np.mean(recon_gain_dbs) if recon_gain_dbs else 0.0
+                sw_gdb = np.mean(swapped_gain_dbs) if swapped_gain_dbs else 0.0
+                pbar.set_postfix(
+                    visqol=f"{running_mean:.4f}", swapped=f"{sw_mean:.4f}",
+                    r_dB=f"{r_gdb:+.2f}", sw_dB=f"{sw_gdb:+.2f}",
+                    n=f"~{len(scores) * world_size}",
+                )
 
         if total_processed >= effective_max:
             break
@@ -290,11 +317,17 @@ def evaluate(
     if distributed:
         all_scores = [None] * world_size
         all_swapped = [None] * world_size
+        all_recon_gdb = [None] * world_size
+        all_swapped_gdb = [None] * world_size
         dist.all_gather_object(all_scores, scores)
         dist.all_gather_object(all_swapped, swapped_scores)
+        dist.all_gather_object(all_recon_gdb, recon_gain_dbs)
+        dist.all_gather_object(all_swapped_gdb, swapped_gain_dbs)
         # Flatten lists from all ranks
         scores = [s for rank_scores in all_scores for s in rank_scores]
         swapped_scores = [s for rank_scores in all_swapped for s in rank_scores]
+        recon_gain_dbs = [s for rank_scores in all_recon_gdb for s in rank_scores]
+        swapped_gain_dbs = [s for rank_scores in all_swapped_gdb for s in rank_scores]
         dist.destroy_process_group()
 
     # ---- report results (rank 0 only) ----
@@ -316,6 +349,15 @@ def evaluate(
         print(f"  Min / Max    :  {np.min(scores):.4f} / {np.max(scores):.4f}")
         print("=" * 60)
 
+    if recon_gain_dbs:
+        gdb_mean, gdb_ci = mean_confidence_interval(recon_gain_dbs, confidence=0.95)
+        print(f"  Gain dB vs Reference – Reconstructed  ({len(recon_gain_dbs)} samples)")
+        print("=" * 60)
+        print(f"  Mean Gain dB :  {gdb_mean:+.4f} ± {gdb_ci:.4f}")
+        print(f"  Std Dev      :  {np.std(recon_gain_dbs):.4f}")
+        print(f"  Min / Max    :  {np.min(recon_gain_dbs):+.4f} / {np.max(recon_gain_dbs):+.4f}")
+        print("=" * 60)
+
     if swapped_scores:
         sw_mean, sw_ci = mean_confidence_interval(swapped_scores, confidence=0.95)
         print(f"  ViSQOL Evaluation – Swapped Latent (gain={gain})  ({len(swapped_scores)} samples)")
@@ -323,6 +365,15 @@ def evaluate(
         print(f"  Mean MOS-LQO :  {sw_mean:.4f} ± {sw_ci:.4f}")
         print(f"  Std Dev      :  {np.std(swapped_scores):.4f}")
         print(f"  Min / Max    :  {np.min(swapped_scores):.4f} / {np.max(swapped_scores):.4f}")
+        print("=" * 60)
+
+    if swapped_gain_dbs:
+        sw_gdb_mean, sw_gdb_ci = mean_confidence_interval(swapped_gain_dbs, confidence=0.95)
+        print(f"  Gain dB vs Reference – Swapped Latent (gain={gain})  ({len(swapped_gain_dbs)} samples)")
+        print("=" * 60)
+        print(f"  Mean Gain dB :  {sw_gdb_mean:+.4f} ± {sw_gdb_ci:.4f}")
+        print(f"  Std Dev      :  {np.std(swapped_gain_dbs):.4f}")
+        print(f"  Min / Max    :  {np.min(swapped_gain_dbs):+.4f} / {np.max(swapped_gain_dbs):+.4f}")
         print("=" * 60)
 
 
